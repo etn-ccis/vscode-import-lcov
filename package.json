@@ -3,7 +3,7 @@
   "displayName": "Import lcov",
   "description": "Import lcov.info files into the VS Code test coverage view.",
   "publisher": "gregoire",
-  "version": "0.0.2",
+  "version": "0.0.98",
   "repository": {
     "type": "git",
     "url": "https://github.com/71/vscode-import-lcov"
