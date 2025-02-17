@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import parseLcov, { SectionSummary } from "@friedemannsommer/lcov-parser";
 import { loadDemangle } from "./demangle";
+import { subscribe } from "node:diagnostics_channel";
 
 interface Configuration {
   lcovFiles: string[];
@@ -9,105 +10,104 @@ interface Configuration {
 let coverageProfile: vscode.TestRunProfile | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log('Extension "import-lcov" is now active!');
+  console.log('import-lcov is now active!');
   // Test controller.
   // -----
   const controller = vscode.tests.createTestController(
     "import-lcov",
-    "Import LCOV",
+    "Import Coverage",
   );
   context.subscriptions.push(controller);
 
   let currentRefreshCts = new vscode.CancellationTokenSource();
   let configuration: Configuration = { lcovFiles: [] };
+  const testRunData = new WeakMap<vscode.FileCoverage, SectionSummary>();
+
+  const collectRunData = async (request: vscode.TestRunRequest, token: vscode.CancellationToken) => {
+    const run = controller.createTestRun(request);
+
+    console.log("import-lcov coverage loading... ");
+
+    // Compute items whose coverage should be processed.
+    const items = new Set(request.include);
+
+    if (items.size === 0) {
+      for (const [, item] of controller.items) {
+        items.add(item);
+      }
+    }
+
+    for (const item of request.exclude ?? []) {
+      items.delete(item);
+    }
+
+    // Read and update coverage.
+    await Promise.all([...items].map(async (item) => {
+      const uri = item.uri!;
+      const contents = await vscode.workspace.fs.readFile(uri);
+
+      if (token.isCancellationRequested) {
+        return;
+      }
+
+      const sections = await parseLcov({ from: contents });
+
+      if (token.isCancellationRequested) {
+        return;
+      }
+
+      for (const section of sections) {
+        let path: vscode.Uri | undefined;
+
+        for (
+          const workspaceFolder of vscode.workspace.workspaceFolders ?? []
+        ) {
+          const workspacePath = workspaceFolder.uri.fsPath;
+
+          if (section.path.startsWith(workspacePath)) {
+            path = vscode.Uri.joinPath(
+              workspaceFolder.uri,
+              section.path.substring(workspacePath.length + 1 /* / */),
+            );
+            break;
+          }
+        }
+
+        const fileCoverage = new vscode.FileCoverage(
+          path ?? vscode.Uri.file(section.path),
+          /*statementCoverage=*/ new vscode.TestCoverageCount(
+            section.lines.hit,
+            section.lines.instrumented,
+          ),
+          /*branchCoverage=*/ new vscode.TestCoverageCount(
+            section.branches.hit,
+            section.branches.instrumented,
+          ),
+          /*declarationCoverage=*/ new vscode.TestCoverageCount(
+            section.functions.hit,
+            section.functions.instrumented,
+          ),
+        );
+
+        testRunData.set(fileCoverage, section);
+        run.addCoverage(fileCoverage);
+      }
+    }));
+
+    run.end();
+  };
 
   const createCoverageProfile = () => {
     if (coverageProfile) {
       coverageProfile.dispose();
     }
-    console.log("Running coverage...");
+    console.log("import-lcov coverage init...");
     coverageProfile = controller.createRunProfile(
       "Coverage",
       vscode.TestRunProfileKind.Coverage,
-      async (request, token) => {
-        const run = controller.createTestRun(
-          request,
-          /*name=*/ undefined,
-          /*persist=*/ true, // Set persist to true if you want to persist the results
-        );
-
-        // Compute items whose coverage should be processed.
-        const items = new Set(request.include);
-
-        if (items.size === 0) {
-          for (const [, item] of controller.items) {
-            items.add(item);
-          }
-        }
-
-        for (const item of request.exclude ?? []) {
-          items.delete(item);
-        }
-
-        // Read and update coverage.
-        await Promise.all([...items].map(async (item) => {
-          const uri = item.uri!;
-          const contents = await vscode.workspace.fs.readFile(uri);
-
-          if (token.isCancellationRequested) {
-            return;
-          }
-
-          const sections = await parseLcov({ from: contents });
-
-          if (token.isCancellationRequested) {
-            return;
-          }
-
-          for (const section of sections) {
-            let path: vscode.Uri | undefined;
-
-            for (
-              const workspaceFolder of vscode.workspace.workspaceFolders ?? []
-            ) {
-              const workspacePath = workspaceFolder.uri.fsPath;
-
-              if (section.path.startsWith(workspacePath)) {
-                path = vscode.Uri.joinPath(
-                  workspaceFolder.uri,
-                  section.path.substring(workspacePath.length + 1 /* / */),
-                );
-                break;
-              }
-            }
-
-            const fileCoverage = new vscode.FileCoverage(
-              path ?? vscode.Uri.file(section.path),
-              /*statementCoverage=*/ new vscode.TestCoverageCount(
-                section.lines.hit,
-                section.lines.instrumented,
-              ),
-              /*branchCoverage=*/ new vscode.TestCoverageCount(
-                section.branches.hit,
-                section.branches.instrumented,
-              ),
-              /*declarationCoverage=*/ new vscode.TestCoverageCount(
-                section.functions.hit,
-                section.functions.instrumented,
-              ),
-            );
-
-            testRunData.set(fileCoverage, section);
-            run.addCoverage(fileCoverage);
-          }
-        }));
-
-        run.end();
-      },
+      collectRunData
     );
-    
-    const testRunData = new WeakMap<vscode.FileCoverage, SectionSummary>();
-  
+      
     let demangle:
       | undefined
       | Promise<{ (mangled: string): string }>
@@ -181,7 +181,7 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   const refreshTests = async () => {
-    console.log("Refreshing tests...");
+    console.log("import-lcov refreshing tests...");
     currentRefreshCts.cancel();
     currentRefreshCts = new vscode.CancellationTokenSource();
 
@@ -207,6 +207,7 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     controller.items.replace(items);
+    collectRunData({ include: items, exclude: [], profile: undefined }, token);
     createCoverageProfile();
   };
 
@@ -214,10 +215,8 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Configuration.
   // -----
-  const fileSystemWatchers = new Map<string, vscode.FileSystemWatcher>();
-
   const refreshConfiguration = () => {
-    console.log('Refreshing configuration...');
+    console.log('import-lcov Refreshing configuration...');
     let lcovFiles = vscode.workspace.getConfiguration("import-lcov").get<
       string | string[]
     >("lcovFiles") ?? [];
@@ -234,36 +233,16 @@ export function activate(context: vscode.ExtensionContext) {
 
     configuration = activeConfig;
 
-    // Recreate file system watchers.
-    const watchersToRemove = new Set(fileSystemWatchers.keys());
-
     for (const lcovFile of lcovFiles) {
-      console.log(`Watching: ${lcovFile}`);
-      if (watchersToRemove.delete(lcovFile)) {
-        // Already watching this glob.
-        continue;
-      }
-
       const watcher = vscode.workspace.createFileSystemWatcher(
         lcovFile,
-        /*ignoreCreateEvents*/ false,
+        /*ignoreCreateEvents*/ true,
         /*ignoreChangeEvents*/ false,
-        /*ignoreDeleteEvents*/ false,
+        /*ignoreDeleteEvents*/ true
       );
+      console.log(`import-lcov Watching: ${lcovFile}`);
 
-      watcher.onDidCreate(refreshTests);
-      watcher.onDidChange(() => {
-        console.log(`File changed: ${lcovFile}`);
-        refreshTests();
-      });
-      watcher.onDidDelete((uri) => controller.items.delete(uri.toString()));
-
-      fileSystemWatchers.set(lcovFile, watcher);
-    }
-
-    for (const lcovFile of watchersToRemove) {
-      fileSystemWatchers.get(lcovFile)!.dispose();
-      fileSystemWatchers.delete(lcovFile);
+      context.subscriptions.push(watcher.onDidChange(() => refreshTests()));
     }
 
     refreshTests();
@@ -276,21 +255,12 @@ export function activate(context: vscode.ExtensionContext) {
       if (e.affectsConfiguration("import-lcov")) {
         refreshConfiguration();
       }
-    }),
-    {
-      dispose() {
-        for (const watcher of fileSystemWatchers.values()) {
-          watcher.dispose();
-        }
-
-        fileSystemWatchers.clear();
-      },
-    },
+    })
   );
 }
 
 export function deactivate() {
-  console.log('Extension "import-lcov" is now deactivated');
+  console.log('import-lcov is now deactivated');
   // Clean up resources, if necessary
   if (coverageProfile) {
     coverageProfile.dispose();
